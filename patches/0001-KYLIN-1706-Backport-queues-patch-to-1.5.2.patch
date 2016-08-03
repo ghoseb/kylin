@@ -1,0 +1,770 @@
+From b24552bf0277081c58691605ecc754f4fcc48329 Mon Sep 17 00:00:00 2001
+From: Joel Victor <joel@helpshift.com>
+Date: Wed, 3 Aug 2016 12:27:37 +0530
+Subject: [PATCH 1/2] KYLIN-1706 Backport queues patch to 1.5.2
+
+---
+ .../org/apache/kylin/common/KylinConfigBase.java   |  18 +++
+ .../org/apache/kylin/common/KylinConfigTest.java   |  52 +++++++
+ .../apache/kylin/cube/CubeSpecificConfigTest.java  | 130 ++++++++--------
+ .../kylin/engine/mr/common/AbstractHadoopJob.java  |  15 +-
+ .../engine/mr/invertedindex/InvertedIndexJob.java  |   2 +-
+ .../apache/kylin/engine/mr/steps/CuboidJob.java    |  16 +-
+ .../engine/mr/steps/FactDistinctColumnsJob.java    |   8 +-
+ .../kylin/engine/mr/steps/InMemCuboidJob.java      |   6 +-
+ .../kylin/engine/mr/steps/MergeCuboidJob.java      |   9 +-
+ .../mr/steps/RowKeyDistributionCheckerJob.java     |   3 +-
+ examples/test_case_data/localmeta/kylin.properties | 164 +++++++++++----------
+ .../hive/cardinality/HiveColumnCardinalityJob.java |   7 +-
+ .../kylin/storage/hbase/ii/IICreateHFileJob.java   |   9 +-
+ .../kylin/storage/hbase/steps/CubeHFileJob.java    |   2 +-
+ .../hbase/steps/RangeKeyDistributionJob.java       |  20 +--
+ 15 files changed, 268 insertions(+), 193 deletions(-)
+ create mode 100644 core-common/src/test/java/org/apache/kylin/common/KylinConfigTest.java
+
+diff --git a/core-common/src/main/java/org/apache/kylin/common/KylinConfigBase.java b/core-common/src/main/java/org/apache/kylin/common/KylinConfigBase.java
+index 1062749..02f31ce 100644
+--- a/core-common/src/main/java/org/apache/kylin/common/KylinConfigBase.java
++++ b/core-common/src/main/java/org/apache/kylin/common/KylinConfigBase.java
+@@ -22,6 +22,8 @@ import java.io.File;
+ import java.io.IOException;
+ import java.io.InputStream;
+ import java.io.Serializable;
++import java.util.Map;
++import java.util.Map.Entry;
+ import java.util.Properties;
+ import java.util.SortedSet;
+ import java.util.regex.Matcher;
+@@ -33,6 +35,7 @@ import org.apache.kylin.common.util.CliCommandExecutor;
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+ 
++import com.google.common.collect.Maps;
+ import com.google.common.collect.Sets;
+ 
+ @SuppressWarnings("serial")
+@@ -85,6 +88,17 @@ abstract public class KylinConfigBase implements Serializable {
+     protected Properties getAllProperties() {
+         return properties;
+     }
++    
++    final protected Map<String, String> getPropertiesByPrefix(String prefix) {
++        Map<String, String> result = Maps.newLinkedHashMap();
++        for (Entry<Object, Object> entry : getAllProperties().entrySet()) {
++            String key = (String) entry.getKey();
++            if (key.startsWith(prefix)) {
++                result.put(key.substring(prefix.length()), (String) entry.getValue());
++            }
++        }
++        return result;
++    }
+ 
+     final protected String[] getOptionalStringArray(String prop, String[] dft) {
+         final String property = getOptional(prop);
+@@ -225,6 +239,10 @@ abstract public class KylinConfigBase implements Serializable {
+         return getOptional("kylin.job.mr.lib.dir", "");
+     }
+ 
++    public Map<String, String> getMRConfigOverride() {
++        return getPropertiesByPrefix("kylin.job.mr.config.override.");
++    }
++
+     public String getKylinSparkJobJarPath() {
+         final String jobJar = getOptional("kylin.job.jar.spark");
+         if (StringUtils.isNotEmpty(jobJar)) {
+diff --git a/core-common/src/test/java/org/apache/kylin/common/KylinConfigTest.java b/core-common/src/test/java/org/apache/kylin/common/KylinConfigTest.java
+new file mode 100644
+index 0000000..9ce1425
+--- /dev/null
++++ b/core-common/src/test/java/org/apache/kylin/common/KylinConfigTest.java
+@@ -0,0 +1,52 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ * 
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ * 
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++*/
++
++package org.apache.kylin.common;
++
++import static org.junit.Assert.*;
++
++import java.util.Map;
++
++import org.apache.kylin.common.KylinConfig;
++import org.apache.kylin.common.util.LocalFileMetadataTestCase;
++import org.junit.After;
++import org.junit.Before;
++import org.junit.Test;
++
++public class KylinConfigTest extends LocalFileMetadataTestCase {
++
++    @Before
++    public void setUp() throws Exception {
++        this.createTestMetadata();
++    }
++
++    @After
++    public void after() throws Exception {
++        this.cleanupTestMetadata();
++    }
++
++    @Test
++    public void testMRConfigOverride() {
++        KylinConfig config = KylinConfig.getInstanceFromEnv();
++        Map<String, String> override = config.getMRConfigOverride();
++        assertEquals(2, override.size());
++        assertEquals("test1", override.get("test1"));
++        assertEquals("test2", override.get("test2"));
++    }
++
++}
+diff --git a/core-cube/src/test/java/org/apache/kylin/cube/CubeSpecificConfigTest.java b/core-cube/src/test/java/org/apache/kylin/cube/CubeSpecificConfigTest.java
+index 00cc66c..51d4e54 100644
+--- a/core-cube/src/test/java/org/apache/kylin/cube/CubeSpecificConfigTest.java
++++ b/core-cube/src/test/java/org/apache/kylin/cube/CubeSpecificConfigTest.java
+@@ -1,70 +1,60 @@
+-/*
+- * Licensed to the Apache Software Foundation (ASF) under one
+- * or more contributor license agreements.  See the NOTICE file
+- * distributed with this work for additional information
+- * regarding copyright ownership.  The ASF licenses this file
+- * to you under the Apache License, Version 2.0 (the
+- * "License"); you may not use this file except in compliance
+- * with the License.  You may obtain a copy of the License at
+- * 
+- *     http://www.apache.org/licenses/LICENSE-2.0
+- * 
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+-*/
+-
+-package org.apache.kylin.cube;
+-
+-import static org.junit.Assert.assertEquals;
+-import static org.junit.Assert.assertTrue;
+-
+-import java.io.File;
+-import java.io.FileInputStream;
+-import java.io.IOException;
+-import java.util.Arrays;
+-
+-import org.apache.kylin.common.KylinConfig;
+-import org.apache.kylin.common.util.JsonUtil;
+-import org.apache.kylin.common.util.LocalFileMetadataTestCase;
+-import org.apache.kylin.cube.model.CubeDesc;
+-import org.apache.kylin.cube.model.validation.IValidatorRule;
+-import org.apache.kylin.cube.model.validation.ValidateContext;
+-import org.apache.kylin.cube.model.validation.rule.AggregationGroupRule;
+-import org.junit.After;
+-import org.junit.Before;
+-import org.junit.Test;
+-
+-public class CubeSpecificConfigTest extends LocalFileMetadataTestCase {
+-
+-    @Before
+-    public void setUp() throws Exception {
+-        this.createTestMetadata();
+-    }
+-
+-    @After
+-    public void after() throws Exception {
+-        this.cleanupTestMetadata();
+-    }
+-
+-    @Test
+-    public void test() {
+-        KylinConfig baseConfig = KylinConfig.getInstanceFromEnv();
+-        CubeDesc cubeDesc = CubeDescManager.getInstance(baseConfig).getCubeDesc("ssb");
+-        verifyOverride(baseConfig, cubeDesc.getConfig());
+-    }
+-
+-    @Test
+-    public void test2() {
+-        KylinConfig baseConfig = KylinConfig.getInstanceFromEnv();
+-        CubeInstance cube = CubeManager.getInstance(baseConfig).getCube("ssb");
+-        verifyOverride(baseConfig, cube.getConfig());
+-    }
+-
+-    private void verifyOverride(KylinConfig base, KylinConfig override) {
+-        assertEquals("gzip", base.getHbaseDefaultCompressionCodec());
+-        assertEquals("lz4", override.getHbaseDefaultCompressionCodec());
+-    }
+-}
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ * 
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ * 
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++*/
++
++package org.apache.kylin.cube;
++
++import static org.junit.Assert.*;
++
++import org.apache.kylin.common.KylinConfig;
++import org.apache.kylin.common.util.LocalFileMetadataTestCase;
++import org.apache.kylin.cube.model.CubeDesc;
++import org.junit.After;
++import org.junit.Before;
++import org.junit.Test;
++
++public class CubeSpecificConfigTest extends LocalFileMetadataTestCase {
++
++    @Before
++    public void setUp() throws Exception {
++        this.createTestMetadata();
++    }
++
++    @After
++    public void after() throws Exception {
++        this.cleanupTestMetadata();
++    }
++
++    @Test
++    public void test() {
++        KylinConfig baseConfig = KylinConfig.getInstanceFromEnv();
++        CubeDesc cubeDesc = CubeDescManager.getInstance(baseConfig).getCubeDesc("ssb");
++        verifyOverride(baseConfig, cubeDesc.getConfig());
++    }
++
++    @Test
++    public void test2() {
++        KylinConfig baseConfig = KylinConfig.getInstanceFromEnv();
++        CubeInstance cube = CubeManager.getInstance(baseConfig).getCube("ssb");
++        verifyOverride(baseConfig, cube.getConfig());
++    }
++
++    private void verifyOverride(KylinConfig base, KylinConfig override) {
++        assertEquals("gzip", base.getHbaseDefaultCompressionCodec());
++        assertEquals("lz4", override.getHbaseDefaultCompressionCodec());
++    }
++}
+diff --git a/engine-mr/src/main/java/org/apache/kylin/engine/mr/common/AbstractHadoopJob.java b/engine-mr/src/main/java/org/apache/kylin/engine/mr/common/AbstractHadoopJob.java
+index e4f253f..5472928 100644
+--- a/engine-mr/src/main/java/org/apache/kylin/engine/mr/common/AbstractHadoopJob.java
++++ b/engine-mr/src/main/java/org/apache/kylin/engine/mr/common/AbstractHadoopJob.java
+@@ -30,6 +30,7 @@ import java.io.IOException;
+ import java.util.ArrayList;
+ import java.util.HashMap;
+ import java.util.Map;
++import java.util.Map.Entry;
+ import java.util.regex.Matcher;
+ import java.util.regex.Pattern;
+ 
+@@ -153,8 +154,8 @@ public abstract class AbstractHadoopJob extends Configured implements Tool {
+         return retVal;
+     }
+ 
+-    protected void setJobClasspath(Job job) {
+-        String jarPath = KylinConfig.getInstanceFromEnv().getKylinJobJarPath();
++    protected void setJobClasspath(Job job, KylinConfig kylinConf) {
++        String jarPath = kylinConf.getKylinJobJarPath();
+         File jarFile = new File(jarPath);
+         if (jarFile.exists()) {
+             job.setJar(jarPath);
+@@ -223,7 +224,7 @@ public abstract class AbstractHadoopJob extends Configured implements Tool {
+         }
+ 
+         // for KylinJobMRLibDir
+-        String mrLibDir = KylinConfig.getInstanceFromEnv().getKylinJobMRLibDir();
++        String mrLibDir = kylinConf.getKylinJobMRLibDir();
+         if (!StringUtils.isBlank(mrLibDir)) {
+             File dirFileMRLIB = new File(mrLibDir);
+             if (dirFileMRLIB.exists()) {
+@@ -236,6 +237,14 @@ public abstract class AbstractHadoopJob extends Configured implements Tool {
+         }
+ 
+         setJobTmpJarsAndFiles(job, kylinDependency.toString());
++
++        overrideJobConfig(job.getConfiguration(), kylinConf.getMRConfigOverride());
++    }
++
++    private void overrideJobConfig(Configuration jobConf, Map<String, String> override) {
++        for (Entry<String, String> entry : override.entrySet()) {
++            jobConf.set(entry.getKey(), entry.getValue());
++        }
+     }
+ 
+     private String filterKylinHiveDependency(String kylinHiveDependency) {
+diff --git a/engine-mr/src/main/java/org/apache/kylin/engine/mr/invertedindex/InvertedIndexJob.java b/engine-mr/src/main/java/org/apache/kylin/engine/mr/invertedindex/InvertedIndexJob.java
+index 9ea2411..f7adf6b 100644
+--- a/engine-mr/src/main/java/org/apache/kylin/engine/mr/invertedindex/InvertedIndexJob.java
++++ b/engine-mr/src/main/java/org/apache/kylin/engine/mr/invertedindex/InvertedIndexJob.java
+@@ -66,7 +66,7 @@ public class InvertedIndexJob extends AbstractHadoopJob {
+             IIInstance ii = getII(iiname);
+             short sharding = ii.getDescriptor().getSharding();
+ 
+-            setJobClasspath(job);
++            setJobClasspath(job, ii.getConfig());
+ 
+             setupMapper(ii.getFirstSegment());
+             setupReducer(output, sharding);
+diff --git a/engine-mr/src/main/java/org/apache/kylin/engine/mr/steps/CuboidJob.java b/engine-mr/src/main/java/org/apache/kylin/engine/mr/steps/CuboidJob.java
+index ce353f7..77a91a2 100644
+--- a/engine-mr/src/main/java/org/apache/kylin/engine/mr/steps/CuboidJob.java
++++ b/engine-mr/src/main/java/org/apache/kylin/engine/mr/steps/CuboidJob.java
+@@ -100,10 +100,9 @@ public class CuboidJob extends AbstractHadoopJob {
+             String segmentName = getOptionValue(OPTION_SEGMENT_NAME);
+             String cubingJobId = getOptionValue(OPTION_CUBING_JOB_ID);
+ 
+-            KylinConfig config = KylinConfig.getInstanceFromEnv();
+-            CubeManager cubeMgr = CubeManager.getInstance(config);
++            CubeManager cubeMgr = CubeManager.getInstance(KylinConfig.getInstanceFromEnv());
+             CubeInstance cube = cubeMgr.getCube(cubeName);
+-            
++
+             if (checkSkip(cubingJobId)) {
+                 logger.info("Skip job " + getOptionValue(OPTION_JOB_NAME) + " for " + cubeName + "[" + segmentName + "]");
+                 return 0;
+@@ -112,7 +111,7 @@ public class CuboidJob extends AbstractHadoopJob {
+             job = Job.getInstance(getConf(), getOptionValue(OPTION_JOB_NAME));
+             logger.info("Starting: " + job.getJobName());
+ 
+-            setJobClasspath(job);
++            setJobClasspath(job, cube.getConfig());
+ 
+             // Mapper
+             configureMapperInputFormat(cube.getSegment(segmentName, SegmentStatusEnum.NEW));
+@@ -136,7 +135,7 @@ public class CuboidJob extends AbstractHadoopJob {
+             // add metadata to distributed cache
+             attachKylinPropsAndMetadata(cube, job.getConfiguration());
+ 
+-            setReduceTaskNum(job, config, cubeName, nCuboidLevel);
++            setReduceTaskNum(job, cube.getDescriptor(), nCuboidLevel);
+ 
+             this.deletePath(job.getConfiguration(), output);
+ 
+@@ -169,12 +168,9 @@ public class CuboidJob extends AbstractHadoopJob {
+         }
+     }
+ 
+-    protected void setReduceTaskNum(Job job, KylinConfig config, String cubeName, int level) throws ClassNotFoundException, IOException, InterruptedException, JobException {
++    protected void setReduceTaskNum(Job job, CubeDesc cubeDesc, int level) throws ClassNotFoundException, IOException, InterruptedException, JobException {
+         Configuration jobConf = job.getConfiguration();
+-        KylinConfig kylinConfig = KylinConfig.getInstanceFromEnv();
+-
+-        CubeDesc cubeDesc = CubeManager.getInstance(config).getCube(cubeName).getDescriptor();
+-        kylinConfig = cubeDesc.getConfig();
++        KylinConfig kylinConfig = cubeDesc.getConfig();
+ 
+         double perReduceInputMB = kylinConfig.getDefaultHadoopJobReducerInputMB();
+         double reduceCountRatio = kylinConfig.getDefaultHadoopJobReducerCountRatio();
+diff --git a/engine-mr/src/main/java/org/apache/kylin/engine/mr/steps/FactDistinctColumnsJob.java b/engine-mr/src/main/java/org/apache/kylin/engine/mr/steps/FactDistinctColumnsJob.java
+index 2dabb7a..90253ba 100644
+--- a/engine-mr/src/main/java/org/apache/kylin/engine/mr/steps/FactDistinctColumnsJob.java
++++ b/engine-mr/src/main/java/org/apache/kylin/engine/mr/steps/FactDistinctColumnsJob.java
+@@ -73,11 +73,9 @@ public class FactDistinctColumnsJob extends AbstractHadoopJob {
+ 
+             // ----------------------------------------------------------------------------
+             // add metadata to distributed cache
+-            KylinConfig kylinConfig = KylinConfig.getInstanceFromEnv();
+-            CubeManager cubeMgr = CubeManager.getInstance(kylinConfig);
++            CubeManager cubeMgr = CubeManager.getInstance(KylinConfig.getInstanceFromEnv());
+             CubeInstance cube = cubeMgr.getCube(cubeName);
+-            CubeDesc cubeDesc = cube.getDescriptor();
+-            List<TblColRef> columnsNeedDict = cubeMgr.getAllDictColumnsOnFact(cubeDesc);
++            List<TblColRef> columnsNeedDict = cubeMgr.getAllDictColumnsOnFact(cube.getDescriptor());
+ 
+             job.getConfiguration().set(BatchConstants.CFG_CUBE_NAME, cubeName);
+             job.getConfiguration().set(BatchConstants.CFG_CUBE_SEGMENT_NAME, segmentName);
+@@ -86,7 +84,7 @@ public class FactDistinctColumnsJob extends AbstractHadoopJob {
+             job.getConfiguration().set(BatchConstants.CFG_STATISTICS_SAMPLING_PERCENT, statistics_sampling_percent);
+             logger.info("Starting: " + job.getJobName());
+ 
+-            setJobClasspath(job);
++            setJobClasspath(job, cube.getConfig());
+ 
+             setupMapper(cube.getSegment(segmentName, SegmentStatusEnum.NEW));
+             setupReducer(output, "true".equalsIgnoreCase(statistics_enabled) ? columnsNeedDict.size() + 1 : columnsNeedDict.size());
+diff --git a/engine-mr/src/main/java/org/apache/kylin/engine/mr/steps/InMemCuboidJob.java b/engine-mr/src/main/java/org/apache/kylin/engine/mr/steps/InMemCuboidJob.java
+index e7bbdf1..aedd42d 100644
+--- a/engine-mr/src/main/java/org/apache/kylin/engine/mr/steps/InMemCuboidJob.java
++++ b/engine-mr/src/main/java/org/apache/kylin/engine/mr/steps/InMemCuboidJob.java
+@@ -86,10 +86,8 @@ public class InMemCuboidJob extends AbstractHadoopJob {
+             String segmentName = getOptionValue(OPTION_SEGMENT_NAME);
+             String output = getOptionValue(OPTION_OUTPUT_PATH);
+ 
+-            KylinConfig config = KylinConfig.getInstanceFromEnv();
+-            CubeManager cubeMgr = CubeManager.getInstance(config);
++            CubeManager cubeMgr = CubeManager.getInstance(KylinConfig.getInstanceFromEnv());
+             CubeInstance cube = cubeMgr.getCube(cubeName);
+-            config = cube.getConfig();
+             CubeSegment cubeSeg = cube.getSegment(segmentName, SegmentStatusEnum.NEW);
+             String cubingJobId = getOptionValue(OPTION_CUBING_JOB_ID);
+ 
+@@ -101,7 +99,7 @@ public class InMemCuboidJob extends AbstractHadoopJob {
+             job = Job.getInstance(getConf(), getOptionValue(OPTION_JOB_NAME));
+             logger.info("Starting: " + job.getJobName());
+             
+-            setJobClasspath(job);
++            setJobClasspath(job, cube.getConfig());
+ 
+             // add metadata to distributed cache
+             attachKylinPropsAndMetadata(cube, job.getConfiguration());
+diff --git a/engine-mr/src/main/java/org/apache/kylin/engine/mr/steps/MergeCuboidJob.java b/engine-mr/src/main/java/org/apache/kylin/engine/mr/steps/MergeCuboidJob.java
+index a391f07..be1a1c1 100644
+--- a/engine-mr/src/main/java/org/apache/kylin/engine/mr/steps/MergeCuboidJob.java
++++ b/engine-mr/src/main/java/org/apache/kylin/engine/mr/steps/MergeCuboidJob.java
+@@ -46,17 +46,16 @@ public class MergeCuboidJob extends CuboidJob {
+ 
+             String cubeName = getOptionValue(OPTION_CUBE_NAME).toUpperCase();
+             String segmentName = getOptionValue(OPTION_SEGMENT_NAME).toUpperCase();
+-            KylinConfig config = KylinConfig.getInstanceFromEnv();
+-            CubeManager cubeMgr = CubeManager.getInstance(config);
++
++            CubeManager cubeMgr = CubeManager.getInstance(KylinConfig.getInstanceFromEnv());
+             CubeInstance cube = cubeMgr.getCube(cubeName);
+-            config = cube.getConfig();
+ 
+             // start job
+             String jobName = getOptionValue(OPTION_JOB_NAME);
+             logger.info("Starting: " + jobName);
+             job = Job.getInstance(getConf(), jobName);
+ 
+-            setJobClasspath(job);
++            setJobClasspath(job, cube.getConfig());
+ 
+             // set inputs
+             addInputDirs(getOptionValue(OPTION_INPUT_PATH), job);
+@@ -83,7 +82,7 @@ public class MergeCuboidJob extends CuboidJob {
+             // add metadata to distributed cache
+             attachKylinPropsAndMetadata(cube, job.getConfiguration());
+ 
+-            setReduceTaskNum(job, config, cubeName, 0);
++            setReduceTaskNum(job, cube.getDescriptor(), 0);
+ 
+             this.deletePath(job.getConfiguration(), output);
+ 
+diff --git a/engine-mr/src/main/java/org/apache/kylin/engine/mr/steps/RowKeyDistributionCheckerJob.java b/engine-mr/src/main/java/org/apache/kylin/engine/mr/steps/RowKeyDistributionCheckerJob.java
+index 41712d9..c5a0ff2 100644
+--- a/engine-mr/src/main/java/org/apache/kylin/engine/mr/steps/RowKeyDistributionCheckerJob.java
++++ b/engine-mr/src/main/java/org/apache/kylin/engine/mr/steps/RowKeyDistributionCheckerJob.java
+@@ -29,6 +29,7 @@ import org.apache.hadoop.mapreduce.lib.input.SequenceFileInputFormat;
+ import org.apache.hadoop.mapreduce.lib.output.FileOutputFormat;
+ import org.apache.hadoop.mapreduce.lib.output.SequenceFileOutputFormat;
+ import org.apache.hadoop.util.ToolRunner;
++import org.apache.kylin.common.KylinConfig;
+ import org.apache.kylin.engine.mr.common.AbstractHadoopJob;
+ 
+ /**
+@@ -58,7 +59,7 @@ public class RowKeyDistributionCheckerJob extends AbstractHadoopJob {
+             String jobName = getOptionValue(OPTION_JOB_NAME);
+             job = Job.getInstance(getConf(), jobName);
+ 
+-            setJobClasspath(job);
++            setJobClasspath(job, KylinConfig.getInstanceFromEnv());
+ 
+             addInputDirs(getOptionValue(OPTION_INPUT_PATH), job);
+ 
+diff --git a/examples/test_case_data/localmeta/kylin.properties b/examples/test_case_data/localmeta/kylin.properties
+index 051a312..9ac7625 100644
+--- a/examples/test_case_data/localmeta/kylin.properties
++++ b/examples/test_case_data/localmeta/kylin.properties
+@@ -1,80 +1,84 @@
+-#
+-# Licensed to the Apache Software Foundation (ASF) under one or more
+-# contributor license agreements.  See the NOTICE file distributed with
+-# this work for additional information regarding copyright ownership.
+-# The ASF licenses this file to You under the Apache License, Version 2.0
+-# (the "License"); you may not use this file except in compliance with
+-# the License.  You may obtain a copy of the License at
+-#
+-#    http://www.apache.org/licenses/LICENSE-2.0
+-#
+-# Unless required by applicable law or agreed to in writing, software
+-# distributed under the License is distributed on an "AS IS" BASIS,
+-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-# See the License for the specific language governing permissions and
+-# limitations under the License.
+-#
+-
+-# optional information for the owner of kylin platform, it can be your team's email
+-# currently it will be attached to each kylin's htable attribute
+-kylin.owner=whoami@kylin.apache.org
+-
+-# List of web servers in use, this enables one web server instance to sync up with other servers.
+-#kylin.rest.servers=localhost:7070
+-
+-# The metadata store in hbase
+-kylin.metadata.url=
+-
+-# The storage for final cube file in hbase
+-kylin.storage.url=hbase
+-
+-# Temp folder in hdfs, make sure user has the right access to the hdfs directory
+-kylin.hdfs.working.dir=/kylin
+-
+-kylin.job.mapreduce.default.reduce.input.mb=500
+-
+-# If true, job engine will not assume that hadoop CLI reside on the same server as it self
+-# you will have to specify kylin.job.remote.cli.hostname, kylin.job.remote.cli.username and kylin.job.remote.cli.password
+-kylin.job.run.as.remote.cmd=false
+-
+-# Only necessary when kylin.job.run.as.remote.cmd=true
+-kylin.job.remote.cli.hostname=
+-
+-# Only necessary when kylin.job.run.as.remote.cmd=true
+-kylin.job.remote.cli.username=
+-
+-# Only necessary when kylin.job.run.as.remote.cmd=true
+-kylin.job.remote.cli.password=
+-
+-# Used by test cases to prepare synthetic data for sample cube
+-kylin.job.remote.cli.working.dir=/tmp/kylin
+-
+-# Max count of concurrent jobs running
+-kylin.job.concurrent.max.limit=10
+-
+-# Time interval to check hadoop job status
+-kylin.job.yarn.app.rest.check.interval.seconds=10
+-
+-#default compression codec for htable,snappy,lzo,gzip,lz4
+-kylin.hbase.default.compression.codec=gzip
+-
+-
+-kylin.security.profile=testing
+-## Config for Restful APP ##
+-# database connection settings:
+-ldap.server=
+-ldap.username=
+-ldap.password=
+-ldap.user.searchBase=
+-ldap.user.searchPattern=
+-ldap.user.groupSearchBase=
+-ldap.service.searchBase=OU=
+-ldap.service.searchPattern=
+-ldap.service.groupSearchBase=
+-acl.adminRole=
+-acl.defaultRole=
+-ganglia.group=
+-ganglia.port=8664
+-
+-
+-
++#
++# Licensed to the Apache Software Foundation (ASF) under one or more
++# contributor license agreements.  See the NOTICE file distributed with
++# this work for additional information regarding copyright ownership.
++# The ASF licenses this file to You under the Apache License, Version 2.0
++# (the "License"); you may not use this file except in compliance with
++# the License.  You may obtain a copy of the License at
++#
++#    http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++#
++
++# optional information for the owner of kylin platform, it can be your team's email
++# currently it will be attached to each kylin's htable attribute
++kylin.owner=whoami@kylin.apache.org
++
++# List of web servers in use, this enables one web server instance to sync up with other servers.
++#kylin.rest.servers=localhost:7070
++
++# The metadata store in hbase
++kylin.metadata.url=
++
++# The storage for final cube file in hbase
++kylin.storage.url=hbase
++
++# Temp folder in hdfs, make sure user has the right access to the hdfs directory
++kylin.hdfs.working.dir=/kylin
++
++kylin.job.mapreduce.default.reduce.input.mb=500
++
++# If true, job engine will not assume that hadoop CLI reside on the same server as it self
++# you will have to specify kylin.job.remote.cli.hostname, kylin.job.remote.cli.username and kylin.job.remote.cli.password
++kylin.job.run.as.remote.cmd=false
++
++# Only necessary when kylin.job.run.as.remote.cmd=true
++kylin.job.remote.cli.hostname=
++
++# Only necessary when kylin.job.run.as.remote.cmd=true
++kylin.job.remote.cli.username=
++
++# Only necessary when kylin.job.run.as.remote.cmd=true
++kylin.job.remote.cli.password=
++
++# Used by test cases to prepare synthetic data for sample cube
++kylin.job.remote.cli.working.dir=/tmp/kylin
++
++# Max count of concurrent jobs running
++kylin.job.concurrent.max.limit=10
++
++# Time interval to check hadoop job status
++kylin.job.yarn.app.rest.check.interval.seconds=10
++
++#default compression codec for htable,snappy,lzo,gzip,lz4
++kylin.hbase.default.compression.codec=gzip
++
++# test for hadoop job config override
++kylin.job.mr.config.override.test1=test1
++kylin.job.mr.config.override.test2=test2
++
++
++kylin.security.profile=testing
++## Config for Restful APP ##
++# database connection settings:
++ldap.server=
++ldap.username=
++ldap.password=
++ldap.user.searchBase=
++ldap.user.searchPattern=
++ldap.user.groupSearchBase=
++ldap.service.searchBase=OU=
++ldap.service.searchPattern=
++ldap.service.groupSearchBase=
++acl.adminRole=
++acl.defaultRole=
++ganglia.group=
++ganglia.port=8664
++
++
++
+diff --git a/source-hive/src/main/java/org/apache/kylin/source/hive/cardinality/HiveColumnCardinalityJob.java b/source-hive/src/main/java/org/apache/kylin/source/hive/cardinality/HiveColumnCardinalityJob.java
+index c613ef6..d03350e 100644
+--- a/source-hive/src/main/java/org/apache/kylin/source/hive/cardinality/HiveColumnCardinalityJob.java
++++ b/source-hive/src/main/java/org/apache/kylin/source/hive/cardinality/HiveColumnCardinalityJob.java
+@@ -70,12 +70,13 @@ public class HiveColumnCardinalityJob extends AbstractHadoopJob {
+             logger.info("Starting: " + jobName);
+             Configuration conf = getConf();
+ 
+-            JobEngineConfig jobEngineConfig = new JobEngineConfig(KylinConfig.getInstanceFromEnv());
++            KylinConfig kylinConfig = KylinConfig.getInstanceFromEnv();
++            JobEngineConfig jobEngineConfig = new JobEngineConfig(kylinConfig);
+             conf.addResource(new Path(jobEngineConfig.getHadoopJobConfFilePath(null)));
+ 
+             job = Job.getInstance(conf, jobName);
+ 
+-            setJobClasspath(job);
++            setJobClasspath(job, kylinConfig);
+ 
+             String table = getOptionValue(OPTION_TABLE);
+             job.getConfiguration().set(BatchConstants.CFG_TABLE_NAME, table);
+@@ -103,7 +104,7 @@ public class HiveColumnCardinalityJob extends AbstractHadoopJob {
+ 
+             logger.info("Going to submit HiveColumnCardinalityJob for table '" + table + "'");
+ 
+-            TableDesc tableDesc = MetadataManager.getInstance(KylinConfig.getInstanceFromEnv()).getTableDesc(table);
++            TableDesc tableDesc = MetadataManager.getInstance(kylinConfig).getTableDesc(table);
+             attachKylinPropsAndMetadata(tableDesc, job.getConfiguration());
+             int result = waitForCompletion(job);
+ 
+diff --git a/storage-hbase/src/main/java/org/apache/kylin/storage/hbase/ii/IICreateHFileJob.java b/storage-hbase/src/main/java/org/apache/kylin/storage/hbase/ii/IICreateHFileJob.java
+index 4781f2b..30dca8e 100644
+--- a/storage-hbase/src/main/java/org/apache/kylin/storage/hbase/ii/IICreateHFileJob.java
++++ b/storage-hbase/src/main/java/org/apache/kylin/storage/hbase/ii/IICreateHFileJob.java
+@@ -28,7 +28,10 @@ import org.apache.hadoop.hbase.mapreduce.HFileOutputFormat;
+ import org.apache.hadoop.mapreduce.Job;
+ import org.apache.hadoop.mapreduce.lib.input.SequenceFileInputFormat;
+ import org.apache.hadoop.mapreduce.lib.output.FileOutputFormat;
++import org.apache.kylin.common.KylinConfig;
+ import org.apache.kylin.engine.mr.common.AbstractHadoopJob;
++import org.apache.kylin.invertedindex.IIInstance;
++import org.apache.kylin.invertedindex.IIManager;
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+ 
+@@ -55,7 +58,11 @@ public class IICreateHFileJob extends AbstractHadoopJob {
+ 
+             job = Job.getInstance(getConf(), getOptionValue(OPTION_JOB_NAME));
+ 
+-            setJobClasspath(job);
++            String iiName = getOptionValue(OPTION_II_NAME);
++            IIManager mgr = IIManager.getInstance(KylinConfig.getInstanceFromEnv());
++            IIInstance ii = mgr.getII(iiName);
++
++            setJobClasspath(job, ii.getConfig());
+ 
+             addInputDirs(getOptionValue(OPTION_INPUT_PATH), job);
+             FileOutputFormat.setOutputPath(job, output);
+diff --git a/storage-hbase/src/main/java/org/apache/kylin/storage/hbase/steps/CubeHFileJob.java b/storage-hbase/src/main/java/org/apache/kylin/storage/hbase/steps/CubeHFileJob.java
+index b92481e..19f37ec 100644
+--- a/storage-hbase/src/main/java/org/apache/kylin/storage/hbase/steps/CubeHFileJob.java
++++ b/storage-hbase/src/main/java/org/apache/kylin/storage/hbase/steps/CubeHFileJob.java
+@@ -74,7 +74,7 @@ public class CubeHFileJob extends AbstractHadoopJob {
+             CubeInstance cube = cubeMgr.getCube(cubeName);
+             job = Job.getInstance(getConf(), getOptionValue(OPTION_JOB_NAME));
+ 
+-            setJobClasspath(job);
++            setJobClasspath(job, cube.getConfig());
+ 
+             addInputDirs(getOptionValue(OPTION_INPUT_PATH), job);
+             FileOutputFormat.setOutputPath(job, output);
+diff --git a/storage-hbase/src/main/java/org/apache/kylin/storage/hbase/steps/RangeKeyDistributionJob.java b/storage-hbase/src/main/java/org/apache/kylin/storage/hbase/steps/RangeKeyDistributionJob.java
+index 9a34da3..ffcbb12 100644
+--- a/storage-hbase/src/main/java/org/apache/kylin/storage/hbase/steps/RangeKeyDistributionJob.java
++++ b/storage-hbase/src/main/java/org/apache/kylin/storage/hbase/steps/RangeKeyDistributionJob.java
+@@ -69,7 +69,12 @@ public class RangeKeyDistributionJob extends AbstractHadoopJob {
+             String jobName = getOptionValue(OPTION_JOB_NAME);
+             job = Job.getInstance(getConf(), jobName);
+ 
+-            setJobClasspath(job);
++            String cubeName = getOptionValue(OPTION_CUBE_NAME).toUpperCase();
++            CubeManager cubeMgr = CubeManager.getInstance(KylinConfig.getInstanceFromEnv());
++            CubeInstance cube = cubeMgr.getCube(cubeName);
++            KylinConfig kylinConfig = cube.getConfig();
++
++            setJobClasspath(job, kylinConfig);
+ 
+             addInputDirs(getOptionValue(OPTION_INPUT_PATH), job);
+ 
+@@ -92,20 +97,17 @@ public class RangeKeyDistributionJob extends AbstractHadoopJob {
+ 
+             this.deletePath(job.getConfiguration(), output);
+ 
+-            String cubeName = getOptionValue(OPTION_CUBE_NAME).toUpperCase();
+-            CubeManager cubeMgr = CubeManager.getInstance(KylinConfig.getInstanceFromEnv());
+-            CubeInstance cube = cubeMgr.getCube(cubeName);
+-            KylinConfig config = cube.getConfig();
+-            float hfileSizeGB = config.getHBaseHFileSizeGB();
+-            float regionSplitSize = config.getKylinHBaseRegionCut();
++
++            float hfileSizeGB = kylinConfig.getHBaseHFileSizeGB();
++            float regionSplitSize = kylinConfig.getKylinHBaseRegionCut();
+ 
+             int compactionThreshold = Integer.valueOf(HBaseConnection.getCurrentHBaseConfiguration().get("hbase.hstore.compactionThreshold", "3"));
+             if (hfileSizeGB > 0 && hfileSizeGB * compactionThreshold < regionSplitSize) {
+                 hfileSizeGB = regionSplitSize / compactionThreshold;
+                 logger.info("Adjust hfile size' to " + hfileSizeGB);
+             }
+-            int maxRegionCount = config.getHBaseRegionCountMax();
+-            int minRegionCount = config.getHBaseRegionCountMin();
++            int maxRegionCount = kylinConfig.getHBaseRegionCountMax();
++            int minRegionCount = kylinConfig.getHBaseRegionCountMin();
+             job.getConfiguration().set(BatchConstants.CFG_OUTPUT_PATH, output.toString());
+             job.getConfiguration().set(BatchConstants.CFG_HFILE_SIZE_GB, String.valueOf(hfileSizeGB));
+             job.getConfiguration().set(BatchConstants.CFG_REGION_SPLIT_SIZE, String.valueOf(regionSplitSize));
+-- 
+2.7.1.339.g0233b80
+
