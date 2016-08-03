@@ -20,6 +20,7 @@ package org.apache.kylin.source.hive;
 
 import java.io.IOException;
 import java.util.Set;
+import java.util.Map;
 
 import com.google.common.collect.Sets;
 import org.apache.commons.lang.StringUtils;
@@ -48,6 +49,9 @@ import org.apache.kylin.metadata.model.IJoinedFlatTableDesc;
 import org.apache.kylin.metadata.model.TableDesc;
 import org.apache.kylin.metadata.model.TblColRef;
 import org.apache.kylin.metadata.realization.IRealizationSegment;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 
 public class HiveMRInput implements IMRInput {
 
@@ -95,16 +99,20 @@ public class HiveMRInput implements IMRInput {
     }
 
     public static class BatchCubingInputSide implements IMRBatchCubingInputSide {
+        private static final Logger logger = LoggerFactory.getLogger(BatchCubingInputSide.class);
 
         final JobEngineConfig conf;
         final IRealizationSegment seg;
         final IJoinedFlatTableDesc flatHiveTableDesc;
+        private static String mapReduceJobQueueName;
+        private static String MAP_REDUCE_JOB_QUEUENAME = "mapreduce.job.queuename";
         String hiveViewIntermediateTables = "";
 
         public BatchCubingInputSide(IRealizationSegment seg) {
             this.conf = new JobEngineConfig(KylinConfig.getInstanceFromEnv());
             this.seg = seg;
             this.flatHiveTableDesc = seg.getJoinedFlatTableDesc();
+            this.mapReduceJobQueueName = getMapReduceJobQueueName();
         }
 
         @Override
@@ -141,8 +149,8 @@ public class HiveMRInput implements IMRInput {
             hiveCmdBuilder.addStatement(dropTableHql);
             hiveCmdBuilder.addStatement(createTableHql);
             hiveCmdBuilder.addStatement(setHql);
+            hiveCmdBuilder.addStatement("\nSET " + MAP_REDUCE_JOB_QUEUENAME + "=" + mapReduceJobQueueName + ";\n");
             hiveCmdBuilder.addStatement(insertDataHqls);
-
             step.setCmd(hiveCmdBuilder.build());
             step.setName(ExecutableConstants.STEP_NAME_CREATE_FLAT_HIVE_TABLE);
 
@@ -180,6 +188,7 @@ public class HiveMRInput implements IMRInput {
             final String useDatabaseHql = "USE " + conf.getConfig().getHiveDatabaseForIntermediateTable() + ";";
             hiveCmdBuilder.addStatement(useDatabaseHql);
             hiveCmdBuilder.addStatement(setHql);
+            hiveCmdBuilder.addStatement("\nSET " + MAP_REDUCE_JOB_QUEUENAME + "=" + mapReduceJobQueueName + ";\n");
             for(TableDesc lookUpTableDesc : lookupViewsTables) {
                 if (TableDesc.TABLE_TYPE_VIRTUAL_VIEW.equalsIgnoreCase(lookUpTableDesc.getTableType())) {
                     StringBuilder createIntermediateTableHql = new StringBuilder();
@@ -217,6 +226,19 @@ public class HiveMRInput implements IMRInput {
 
         private String getIntermediateTableIdentity() {
             return conf.getConfig().getHiveDatabaseForIntermediateTable() + "." + flatHiveTableDesc.getTableName();
+        }
+
+        private String getMapReduceJobQueueName() {
+            KylinConfig kylinConfig = KylinConfig.getInstanceFromEnv();
+            CubeManager cubeMgr = CubeManager.getInstance(kylinConfig);
+            String cubeName = seg.getRealization().getName();
+            KylinConfig cubeConfig = cubeMgr.getCube(cubeName).getConfig();
+            Map<String,String> mapReduceOverrides = cubeConfig.getMRConfigOverride();
+            logger.info("Cube name is:");
+            logger.info(cubeName);
+            logger.info("Overrides are:");
+            logger.info(mapReduceOverrides.toString());
+            return mapReduceOverrides.containsKey(MAP_REDUCE_JOB_QUEUENAME) ? mapReduceOverrides.get(MAP_REDUCE_JOB_QUEUENAME) : "default";
         }
     }
 
