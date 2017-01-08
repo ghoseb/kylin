@@ -19,6 +19,8 @@
 package org.apache.kylin.engine.mr.steps;
 
 import java.util.*;
+import java.lang.Math;
+import java.lang.Integer;
 
 import org.apache.commons.cli.Option;
 import org.apache.commons.cli.OptionBuilder;
@@ -46,10 +48,13 @@ public class MetadataCleanupJob extends AbstractHadoopJob {
     @SuppressWarnings("static-access")
     private static final Option OPTION_DELETE = OptionBuilder.withArgName("delete").hasArg().isRequired(false).withDescription("Delete the unused metadata").create("delete");
 
+    @SuppressWarnings("static-access")
+    private static final Option OPTION_JOB_THRESHOLD = OptionBuilder.withArgName("job_threshold").hasArg().isRequired(false).withDescription("Deletion threshold for cleaning unused metdata").create("job_threshold");
+
     protected static final Logger logger = LoggerFactory.getLogger(MetadataCleanupJob.class);
 
     boolean delete = false;
-
+    long threshold = Long.MAX_VALUE;
     private KylinConfig config = null;
 
     public static final long TIME_THREADSHOLD = 2 * 24 * 3600 * 1000l; // 2 days
@@ -67,11 +72,18 @@ public class MetadataCleanupJob extends AbstractHadoopJob {
         logger.info("jobs args: " + Arrays.toString(args));
         try {
             options.addOption(OPTION_DELETE);
+            options.addOption(OPTION_JOB_THRESHOLD);
             parseOptions(options, args);
 
             logger.info("options: '" + getOptionsAsString() + "'");
             logger.info("delete option value: '" + getOptionValue(OPTION_DELETE) + "'");
+            logger.info("threshold option value: '" + getOptionValue(OPTION_JOB_THRESHOLD) + "'");
+
             delete = Boolean.parseBoolean(getOptionValue(OPTION_DELETE));
+            String thresholdStringValue = getOptionValue(OPTION_JOB_THRESHOLD);
+            if (thresholdStringValue != null) {
+                threshold = Integer.parseInt(getOptionValue(OPTION_JOB_THRESHOLD)) * 24 * 3600 * 1000l;
+            }
 
             config = KylinConfig.getInstanceFromEnv();
 
@@ -144,14 +156,16 @@ public class MetadataCleanupJob extends AbstractHadoopJob {
                             }
                 }
         }
-        
+
         // delete old and completed jobs
         ExecutableDao executableDao = ExecutableDao.getInstance(KylinConfig.getInstanceFromEnv());
         List<ExecutablePO> allExecutable = executableDao.getJobs();
+        long jobThreshold = Math.min(threshold, TIME_THREADSHOLD_FOR_JOB);
+        logger.info("Deleting all data with threshold more than " + jobThreshold);
         for (ExecutablePO executable : allExecutable) {
             long lastModified = executable.getLastModified();
             ExecutableOutputPO output = executableDao.getJobOutput(executable.getUuid());
-            if (System.currentTimeMillis() - lastModified > TIME_THREADSHOLD_FOR_JOB && (ExecutableState.SUCCEED.toString().equals(output.getStatus()) || ExecutableState.DISCARDED.toString().equals(output.getStatus()))) {
+            if (System.currentTimeMillis() - lastModified > jobThreshold && (ExecutableState.SUCCEED.toString().equals(output.getStatus()) || ExecutableState.DISCARDED.toString().equals(output.getStatus()))) {
                 toDeleteResource.add(ResourceStore.EXECUTE_RESOURCE_ROOT + "/" + executable.getUuid());
                 toDeleteResource.add(ResourceStore.EXECUTE_OUTPUT_RESOURCE_ROOT + "/" + executable.getUuid());
 

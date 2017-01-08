@@ -85,6 +85,6 @@ else
     echo "       metastore.sh list RESOURCE_PATH"
     echo "       metastore.sh cat RESOURCE_PATH"
     echo "       metastore.sh remove RESOURCE_PATH"
-    echo "       metastore.sh clean [--delete true]"
+    echo "       metastore.sh clean [--delete true] [--job_threshold 30]"
     exit 1
 fi
