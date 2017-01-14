@@ -231,8 +231,8 @@ then
     source ${dir}/find-hive-dependency.sh
     source ${dir}/find-hbase-dependency.sh
     #retrive $KYLIN_EXTRA_START_OPTS
-    if [ -f "${dir}/setenv-tool.sh" ]
-        then source ${dir}/setenv-tool.sh
+    if [ -f "${dir}/setenv.sh" ]
+        then source ${dir}/setenv.sh
     fi
 
     export HBASE_CLASSPATH=${KYLIN_HOME}/lib/*:$hive_dependency:${HBASE_CLASSPATH}
